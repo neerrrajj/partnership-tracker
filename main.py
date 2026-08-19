@@ -9,6 +9,12 @@ import json
 
 st.set_page_config(page_title="Partnership Tracker", page_icon="📊", layout="wide")
 
+PARTNERS = ["Ravi", "Neeraj", "Dharmesh"]
+
+# Business actually started operating on this date. This predates any capital
+# event and is a fixed historical fact, so it lives here rather than in a sheet.
+PHASE1_START = date(2025, 11, 1)
+
 # ─── Auth ───────────────────────────────────────────────────────────────────
 
 @st.cache_resource
@@ -18,23 +24,37 @@ def get_gsheet():
     client = gspread.authorize(creds)
     return client.open_by_key(st.secrets["google"]["sheet_id"])
 
+# ─── Capital Events — single sheet, single source of truth ─────────────────
+# Columns: Date | Partner | Amount | Notes
+# e.g.  3/11/25  | Ravi     | 855400 |
+#       25/4/26  | Neeraj   | 50000  |
+#       25/4/26  | Dharmesh | 50000  |
+# Use a negative Amount for a withdrawal. No "Type" column needed.
+
 @st.cache_data(ttl=300)
 def get_capital_events():
     sh = get_gsheet()
     ws = sh.worksheet("Capital Events")
     df = pd.DataFrame(ws.get_all_records())
     if df.empty:
-        df = pd.DataFrame(columns=["Date", "Partner", "Type", "Amount", "Notes"])
-        df["Date"] = pd.to_datetime(df["Date"])
-        return df
+        return pd.DataFrame(columns=["Date", "Partner", "Amount", "Notes"])
     df["Date"] = pd.to_datetime(df["Date"], dayfirst=True)
     df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce").fillna(0)
-    df.loc[df["Type"] == "Withdrawal", "Amount"] *= -1
     df = df.sort_values("Date").reset_index(drop=True)
     return df
 
-@st.cache_data(ttl=300)
-def get_erpnext_pnl(from_date: str, to_date: str):
+def get_phase2_start(events_df: pd.DataFrame) -> date:
+    """Phase 2 begins the day a partner OTHER than Ravi first contributes."""
+    others = events_df[events_df["Partner"] != "Ravi"]
+    if others.empty:
+        # No one else has joined yet — treat "today" as a placeholder so the
+        # app still runs; Phase 2 tables will simply be empty.
+        return date.today()
+    return others["Date"].min().date()
+
+# ─── ERPNext P&L ────────────────────────────────────────────────────────────
+
+def _run_pnl_report(from_date: str, to_date: str, periodicity: str):
     url = st.secrets["erpnext"]["url"].rstrip("/")
     api_key = st.secrets["erpnext"]["api_key"]
     api_secret = st.secrets["erpnext"]["api_secret"]
@@ -46,9 +66,7 @@ def get_erpnext_pnl(from_date: str, to_date: str):
         "filter_based_on": "Date Range",
         "period_start_date": from_date,
         "period_end_date": to_date,
-        "from_fiscal_year": str(pd.to_datetime(from_date).year),
-        "to_fiscal_year": str(pd.to_datetime(to_date).year),
-        "periodicity": "Monthly",
+        "periodicity": periodicity,
         "accumulated_values": 0,
         "include_default_book_entries": 1,
     }
@@ -63,12 +81,9 @@ def get_erpnext_pnl(from_date: str, to_date: str):
         timeout=15,
     )
     resp.raise_for_status()
-    raw = resp.json()
-    data = raw.get("message", {})
-    # Debug: store raw response for sidebar inspection
-    st.session_state["erpnext_raw"] = raw
+    return resp.json().get("message", {})
 
-    # Find net profit row — handle both dict rows and list rows
+def _extract_net_profit_row(data: dict):
     rows = data.get("result", [])
     cols = data.get("columns", [])
     account_idx = None
@@ -88,174 +103,126 @@ def get_erpnext_pnl(from_date: str, to_date: str):
         if "net profit" in label or "profit for the year" in label or "net loss" in label:
             period_vals = {}
             for col in cols:
-                fieldname = col.get("fieldname", "") if isinstance(col, dict) else ""
-                if fieldname and fieldname != "account":
-                    if isinstance(row, dict):
+                if not isinstance(col, dict):
+                    continue
+                fieldname = col.get("fieldname", "")
+                # Only real period/total currency columns — skip metadata
+                # fields (acc_name, acc_number, currency, ...) which are
+                # absent on this row and would otherwise default to 0.
+                if not fieldname or fieldname == "account" or col.get("fieldtype") != "Currency":
+                    continue
+                if isinstance(row, dict):
+                    if fieldname in row:
                         period_vals[fieldname] = row.get(fieldname, 0) or 0
-                    elif isinstance(row, list):
-                        # find column index
-                        for idx, c in enumerate(cols):
-                            if isinstance(c, dict) and c.get("fieldname") == fieldname:
-                                period_vals[fieldname] = row[idx] if idx < len(row) else 0
-                                break
+                elif isinstance(row, list):
+                    for idx, c in enumerate(cols):
+                        if isinstance(c, dict) and c.get("fieldname") == fieldname:
+                            period_vals[fieldname] = row[idx] if idx < len(row) else 0
+                            break
             return period_vals
     return {}
 
-# ─── Core Calculation ───────────────────────────────────────────────────────
-
-PARTNERS = ["Neeraj", "Dharmesh", "Ravi"]
+@st.cache_data(ttl=300)
+def get_pnl_for_range(from_date: date, to_date: date) -> float:
+    """Total net profit for a single date range (Phase 1's one-line figure)."""
+    if from_date > to_date:
+        return 0.0
+    data = _run_pnl_report(str(from_date), str(to_date), periodicity="Yearly")
+    st.session_state["erpnext_raw_phase1"] = data
+    period_vals = _extract_net_profit_row(data)
+    for fieldname, val in period_vals.items():
+        if fieldname != "total":
+            return float(val or 0)
+    return float(period_vals.get("total", 0) or 0)
 
 @st.cache_data(ttl=300)
-def get_opening_data():
-    try:
-        sh = get_gsheet()
-        ws = sh.worksheet("Opening")
-        df = pd.DataFrame(ws.get_all_records())
-    except Exception:
+def get_monthly_pnl_map(from_date: date, to_date: date) -> dict:
+    if from_date > to_date:
         return {}
-    if df.empty:
-        return {}
-    row = df.iloc[0].to_dict()
-    for col in ["Receivables", "Inventory", "Ravi"]:
-        if col in row:
-            row[col] = pd.to_numeric(row[col], errors="coerce")
-    return row
+    data = _run_pnl_report(str(from_date), str(to_date), periodicity="Monthly")
+    st.session_state["erpnext_raw_phase2"] = data
+    return _extract_net_profit_row(data)
 
-def get_opening_capitals():
-    data = get_opening_data()
-    ravi = (data.get("Receivables", 0) or 0) + (data.get("Inventory", 0) or 0) + (data.get("Ravi", 0) or 0)
-    return {
-        "Neeraj": 0,
-        "Dharmesh": 0,
-        "Ravi": ravi,
-    }
+def _lookup_month_profit(pnl_map: dict, month_start: date) -> float:
+    for period_key, profit in pnl_map.items():
+        if period_key == "total":
+            continue
+        try:
+            period_date = pd.to_datetime(period_key)
+        except Exception:
+            try:
+                period_date = pd.to_datetime(period_key, format="%b_%Y")
+            except Exception:
+                continue
+        if period_date.year == month_start.year and period_date.month == month_start.month:
+            return float(profit or 0)
+    return 0.0
 
-def get_opening_date():
-    data = get_opening_data()
-    return pd.to_datetime(data.get("Date", ""), dayfirst=True)
+# ─── Capital account as of a given date, built purely from events ──────────
 
-def weighted_avg_capital(events_df: pd.DataFrame, partner: str, month_start: date, month_end: date) -> float:
-    opening = get_opening_capitals()
-    opening_date = get_opening_date().date()
-    month_start = pd.Timestamp(month_start).date()
-    month_end = pd.Timestamp(month_end).date()
+def capital_as_of(events_df: pd.DataFrame, partner: str, as_of: date) -> float:
+    if events_df.empty:
+        return 0.0
+    events = events_df[(events_df["Partner"] == partner) & (events_df["Date"].dt.date <= as_of)]
+    return float(events["Amount"].sum())
 
-    # If this month ends before opening, no capital deployed
-    if month_end < opening_date:
-        return 0
+# ─── Phase 2 monthly allocation ─────────────────────────────────────────────
 
-    # Partners with opening capital (like Ravi) count from month start — they had capital all along.
-    # Partners with zero opening count from opening_date — they joined on that date.
-    effective_start = month_start if opening.get(partner, 0) > 0 else max(month_start, opening_date)
-
-    # Build running balance up to effective_start
-    prior = events_df[
-        (events_df["Partner"] == partner) &
-        (events_df["Date"].dt.date < effective_start)
-    ]
-    balance = opening.get(partner, 0) + prior["Amount"].sum()
-
-    # Events within this month from effective_start onwards
-    month_events = events_df[
-        (events_df["Partner"] == partner) &
-        (events_df["Date"].dt.date >= effective_start) &
-        (events_df["Date"].dt.date <= month_end)
-    ].sort_values("Date")
-
-    # Build segments
-    segments = []
-    cursor = effective_start
-    for _, row in month_events.iterrows():
-        event_date = row["Date"].date()
-        if event_date > cursor:
-            segments.append((balance, (event_date - cursor).days))
-        balance += row["Amount"]
-        cursor = event_date
-    # Remaining days
-    remaining = (month_end - cursor).days + 1
-    segments.append((balance, remaining))
-
-    total_days = (month_end - month_start).days + 1
-    wtd = sum(bal * days for bal, days in segments) / total_days
-    return wtd
-
-def compute_monthly_allocations(events_df: pd.DataFrame, pnl_map: dict):
-    """
-    pnl_map: {period_key: net_profit_value}
-    Returns list of monthly dicts with weighted capitals, ratios, shares, capital accounts
-    """
-    opening = get_opening_capitals()
-    capital_accounts = {p: opening[p] for p in PARTNERS}
+def compute_phase2(events_df: pd.DataFrame, phase2_start: date, opening_capital: dict, pnl_map: dict):
+    capital = dict(opening_capital)
+    today = date.today()
     results = []
 
-    opening_date = get_opening_date().date()
-    today = date.today()
-
-    # Generate all months from opening date to today
-    current_month_start = opening_date.replace(day=1)
+    current_month_start = phase2_start
     while current_month_start <= today:
         last_day = calendar.monthrange(current_month_start.year, current_month_start.month)[1]
-        month_end_full = current_month_start.replace(day=last_day)
-        month_end = month_end_full
-        # Cap current month at today
-        if current_month_start.year == today.year and current_month_start.month == today.month:
-            month_end = today
+        month_end_full = date(current_month_start.year, current_month_start.month, last_day)
+        month_end = min(month_end_full, today)
+
         month_label = current_month_start.strftime("%b %Y")
-        # Mark incomplete month
-        if month_end < month_end_full:
+        if current_month_start.day > 1:
+            month_label = f"{month_label} ({current_month_start.strftime('%d')}\u2013{month_end.strftime('%d')})"
+        elif month_end < month_end_full:
             days_elapsed = (month_end - current_month_start).days + 1
             month_label = f"{month_label} ({days_elapsed}/{last_day})"
 
-        # Look up P&L for this month from ERPNext data
-        net_profit = 0
-        for period_key, profit in pnl_map.items():
-            if period_key == "total":
-                continue
-            try:
-                # Try standard date format first (e.g. 2026-04-01)
-                period_date = pd.to_datetime(period_key)
-            except Exception:
-                try:
-                    # ERPNext monthly columns use format like "apr_2026"
-                    period_date = pd.to_datetime(period_key, format="%b_%Y")
-                except Exception:
-                    continue
-            if period_date.year == current_month_start.year and period_date.month == current_month_start.month:
-                net_profit = profit
-                break
+        net_profit = _lookup_month_profit(pnl_map, current_month_start)
 
-        wtd = {p: weighted_avg_capital(events_df, p, current_month_start, month_end) for p in PARTNERS}
-        total_wtd = sum(wtd.values())
+        total_capital = sum(capital.values())
+        ratios = {p: (capital[p] / total_capital if total_capital else 0) for p in PARTNERS}
+        shares = {p: net_profit * ratios[p] for p in PARTNERS}
 
-        shares = {}
         for p in PARTNERS:
-            ratio = wtd[p] / total_wtd if total_wtd else 0
-            shares[p] = net_profit * ratio
-            capital_accounts[p] += shares[p]
-            # Add contributions/withdrawals for this month
-            month_contrib = events_df[
-                (events_df["Partner"] == p) &
-                (events_df["Date"] >= pd.Timestamp(current_month_start)) &
-                (events_df["Date"] <= pd.Timestamp(month_end))
-            ]["Amount"].sum()
-            capital_accounts[p] += month_contrib
+            capital[p] += shares[p]
+            if not events_df.empty:
+                if current_month_start == phase2_start:
+                    # avoid re-counting the contribution that DEFINED phase2_start
+                    mask = (events_df["Partner"] == p) & \
+                           (events_df["Date"].dt.date > current_month_start) & \
+                           (events_df["Date"].dt.date <= month_end)
+                else:
+                    mask = (events_df["Partner"] == p) & \
+                           (events_df["Date"].dt.date >= current_month_start) & \
+                           (events_df["Date"].dt.date <= month_end)
+                month_events = events_df[mask]["Amount"].sum()
+            else:
+                month_events = 0
+            capital[p] += month_events
 
         results.append({
             "Month": month_label,
             "Net Profit": net_profit,
-            **{f"{p} Wtd Capital": wtd[p] for p in PARTNERS},
-            **{f"{p} Ratio": (wtd[p] / total_wtd if total_wtd else 0) for p in PARTNERS},
+            **{f"{p} Ratio": ratios[p] for p in PARTNERS},
             **{f"{p} Share": shares[p] for p in PARTNERS},
-            **{f"{p} Capital A/C": capital_accounts[p] for p in PARTNERS},
+            **{f"{p} Capital A/C": capital[p] for p in PARTNERS},
         })
 
-        # Advance to next month
         if current_month_start.month == 12:
-            current_month_start = current_month_start.replace(year=current_month_start.year + 1, month=1)
+            current_month_start = date(current_month_start.year + 1, 1, 1)
         else:
-            current_month_start = current_month_start.replace(month=current_month_start.month + 1)
+            current_month_start = date(current_month_start.year, current_month_start.month + 1, 1)
 
-    return results, {p: capital_accounts[p] for p in PARTNERS}
+    return results, capital
 
 # ─── Formatting ─────────────────────────────────────────────────────────────
 
@@ -279,149 +246,127 @@ if st.sidebar.button("🔄 Refresh Data"):
     st.rerun()
 
 with st.sidebar.expander("🔧 Debug ERPNext"):
-    if "erpnext_raw" in st.session_state:
-        st.json(st.session_state["erpnext_raw"])
-    else:
-        st.caption("No response yet. Refresh data.")
+    st.caption("Phase 1 (single range) raw response:")
+    st.json(st.session_state.get("erpnext_raw_phase1", {"info": "No response yet. Refresh data."}))
+    st.caption("Phase 2 (monthly) raw response:")
+    st.json(st.session_state.get("erpnext_raw_phase2", {"info": "No response yet. Refresh data."}))
 
-opening_date = get_opening_date()
-from_date = opening_date.replace(day=1).date()  # First day of opening month
-to_date = date.today()
+events_df = get_capital_events()
+phase2_start = get_phase2_start(events_df)
+phase1_end = phase2_start - pd.Timedelta(days=1)
+phase1_end = phase1_end.date() if hasattr(phase1_end, "date") else phase1_end
+today = date.today()
 
-# Load data
-with st.spinner("Loading capital events..."):
-    events_df = get_capital_events()
+erpnext_ok = True
+try:
+    with st.spinner("Fetching Phase 1 P&L (business start → day before partnership)..."):
+        phase1_profit = get_pnl_for_range(PHASE1_START, phase1_end)
+    with st.spinner("Fetching Phase 2 monthly P&L..."):
+        pnl_map = get_monthly_pnl_map(phase2_start, today)
+except Exception as e:
+    st.warning(f"Could not fetch ERPNext P&L: {e}. Using zeros.")
+    phase1_profit = 0.0
+    pnl_map = {}
+    erpnext_ok = False
 
-with st.spinner("Fetching P&L from ERPNext..."):
-    try:
-        pnl_map = get_erpnext_pnl(str(from_date), str(to_date))
-        erpnext_ok = True
-    except Exception as e:
-        st.warning(f"Could not fetch ERPNext P&L: {e}. Using empty P&L.")
-        pnl_map = {}
-        erpnext_ok = False
+# Capital entering Phase 2 = each partner's contributions up to phase2_start,
+# with Ravi additionally credited the full Phase 1 profit (he earned it solo).
+opening_capital = {p: capital_as_of(events_df, p, phase2_start) for p in PARTNERS}
+opening_capital["Ravi"] += phase1_profit
 
-# Compute
-monthly_data, closed_accounts = compute_monthly_allocations(events_df, pnl_map)
+phase2_results, closing_capital = compute_phase2(events_df, phase2_start, opening_capital, pnl_map)
+
+total_shares = {"Ravi": phase1_profit, "Neeraj": 0.0, "Dharmesh": 0.0}
+for row in phase2_results:
+    for p in PARTNERS:
+        total_shares[p] += row[f"{p} Share"]
+total_allocated = sum(total_shares.values())
 
 # ── Section 1: Current Value ──
 st.subheader("💰 Current Value (What Each Partner Is Owed Today)")
-st.caption(f"Based on data up to {to_date.strftime('%d %b %Y')}")
+st.caption(f"Based on data up to {today.strftime('%d %b %Y')}")
 
-opening = get_opening_capitals()
 cols = st.columns(3)
 for i, p in enumerate(PARTNERS):
-    current_val = closed_accounts.get(p, opening[p])
+    current_val = closing_capital.get(p, opening_capital[p])
     total_contrib = events_df[events_df["Partner"] == p]["Amount"].sum() if not events_df.empty else 0
-    profit = current_val - opening[p] - total_contrib
-    deployed = opening[p] + total_contrib
-    roi = (profit / deployed * 100) if deployed else 0
+    profit = total_shares[p]
+    roi = (profit / total_contrib * 100) if total_contrib else 0
     with cols[i]:
         st.metric(
             label=p,
             value=inr(current_val),
-            delta=f"{inr(profit)} profit ({roi:.1f}%) — {inr(deployed)} deployed"
+            delta=f"{inr(profit)} profit ({roi:.1f}%) — {inr(total_contrib)} contributed"
         )
 
-st.divider()
-
-# ── Section 2: Capital Accounts (closed months) ──
-st.subheader("🏦 Capital Accounts — Closed Months")
-opening = get_opening_capitals()
-cap_data = []
-for p in PARTNERS:
-    display_cap = closed_accounts.get(p, opening[p])
-    total_contrib = events_df[events_df["Partner"] == p]["Amount"].sum() if not events_df.empty else 0
-    profit = display_cap - opening[p] - total_contrib
-    deployed = opening[p] + total_contrib
-    cap_data.append({
-        "Partner": p,
-        "Opening Capital": inr(opening[p]),
-        "Contributions": inr(total_contrib),
-        "Profit": inr(profit),
-        "Current Capital A/C": inr(display_cap),
-        "ROI": pct(profit / deployed) if deployed else "—",
-    })
-st.dataframe(pd.DataFrame(cap_data).set_index("Partner"), use_container_width=True)
+st.caption(
+    f"Sum of all partners' profit: **{inr(total_allocated)}** — "
+    f"should match ERPNext's total net profit since business start ({PHASE1_START.strftime('%d %b %Y')})."
+)
 
 st.divider()
 
-# ── Section 3: Monthly Breakdown ──
+# ── Section 2: Single combined monthly breakdown (Phase 1 lump + Phase 2 months) ──
 st.subheader("📅 Monthly Breakdown")
 
-if monthly_data:
-    tabs = st.tabs(["Summary", "Profit Shares", "Weighted Capitals", "Ratios", "Capital Accounts"])
+first_row = {
+    "Month": f"{PHASE1_START.strftime('%b %Y')} \u2013 {phase1_end.strftime('%d %b %Y')}",
+    "Net Profit": phase1_profit,
+    "Neeraj Ratio": 0.0, "Dharmesh Ratio": 0.0, "Ravi Ratio": 1.0,
+    "Neeraj Share": 0.0, "Dharmesh Share": 0.0, "Ravi Share": phase1_profit,
+    "Neeraj Capital A/C": opening_capital["Neeraj"],
+    "Dharmesh Capital A/C": opening_capital["Dharmesh"],
+    "Ravi Capital A/C": opening_capital["Ravi"],
+}
+all_rows = [first_row] + phase2_results
 
-    df_monthly = pd.DataFrame(monthly_data)
+if all_rows:
+    df_monthly = pd.DataFrame(all_rows)
+    tabs = st.tabs(["Summary", "Ratios", "Capital Accounts"])
 
     with tabs[0]:
         summary = df_monthly[["Month", "Net Profit"] + [f"{p} Share" for p in PARTNERS]]
         fmt = {"Net Profit": inr, **{f"{p} Share": inr for p in PARTNERS}}
         st.dataframe(summary.style.format(fmt), use_container_width=True, hide_index=True)
-
-    with tabs[1]:
-        share_cols = ["Month"] + [f"{p} Share" for p in PARTNERS]
-        share_df = df_monthly[share_cols].copy()
-        st.dataframe(share_df.style.format({f"{p} Share": inr for p in PARTNERS}),
-                     use_container_width=True, hide_index=True)
-
-        # Bar chart
         chart_df = df_monthly.set_index("Month")[[f"{p} Share" for p in PARTNERS]]
         chart_df.columns = PARTNERS
-        st.bar_chart(chart_df)
+        # st.bar_chart(chart_df)
+
+    with tabs[1]:
+        ratio_cols = ["Month"] + [f"{p} Ratio" for p in PARTNERS]
+        st.dataframe(df_monthly[ratio_cols].style.format({f"{p} Ratio": pct for p in PARTNERS}),
+                     use_container_width=True, hide_index=True)
 
     with tabs[2]:
-        wtd_cols = ["Month"] + [f"{p} Wtd Capital" for p in PARTNERS]
-        wtd_df = df_monthly[wtd_cols].copy()
-        st.dataframe(wtd_df.style.format({f"{p} Wtd Capital": inr for p in PARTNERS}),
-                     use_container_width=True, hide_index=True)
-
-    with tabs[3]:
-        ratio_cols = ["Month"] + [f"{p} Ratio" for p in PARTNERS]
-        ratio_df = df_monthly[ratio_cols].copy()
-        st.dataframe(ratio_df.style.format({f"{p} Ratio": pct for p in PARTNERS}),
-                     use_container_width=True, hide_index=True)
-
-    with tabs[4]:
         acc_cols = ["Month"] + [f"{p} Capital A/C" for p in PARTNERS]
-        acc_df = df_monthly[acc_cols].copy()
-        st.dataframe(acc_df.style.format({f"{p} Capital A/C": inr for p in PARTNERS}),
+        st.dataframe(df_monthly[acc_cols].style.format({f"{p} Capital A/C": inr for p in PARTNERS}),
                      use_container_width=True, hide_index=True)
-
         line_df = df_monthly.set_index("Month")[[f"{p} Capital A/C" for p in PARTNERS]]
         line_df.columns = PARTNERS
-        st.line_chart(line_df)
+        # st.line_chart(line_df)
 else:
-    st.info("No monthly data available.")
+    st.info("No data yet.")
 
-st.divider()
+# st.divider()
 
 # ── Section 4: Capital Events Log ──
 st.subheader("📋 Capital Events Log")
 if not events_df.empty:
     display_df = events_df.copy()
     display_df["Date"] = display_df["Date"].dt.strftime("%d %b %Y")
-    # Show original amount (before sign flip)
-    display_df["Amount"] = display_df["Amount"].abs().apply(lambda x: inr(x))
-    st.dataframe(display_df[["Date", "Partner", "Type", "Amount", "Notes"]], 
+    display_df["Amount"] = display_df["Amount"].apply(inr)
+    st.dataframe(display_df[["Date", "Partner", "Amount", "Notes"]],
                  use_container_width=True, hide_index=True)
 else:
     st.info("No capital events found. Add entries to the Google Sheet.")
 
-# ── Section 5: Current Month Weighted Capitals ──
-with st.expander("🔍 Current Month Weighted Capital Details"):
-    today = date.today()
-    month_start = today.replace(day=1)
-    last_day = calendar.monthrange(today.year, today.month)[1]
-    month_end = today.replace(day=last_day)
-    live_wtd = {p: weighted_avg_capital(events_df, p, month_start, month_end) for p in PARTNERS}
-    total = sum(live_wtd.values())
-    rows = []
-    for p in PARTNERS:
-        rows.append({
-            "Partner": p,
-            "Weighted Capital": inr(live_wtd[p]),
-            "Ratio": pct(live_wtd[p] / total if total else 0),
-        })
-    st.dataframe(pd.DataFrame(rows).set_index("Partner"), use_container_width=True)
-    st.caption(f"Based on {(today - month_start).days + 1} days elapsed out of {last_day} days in current month.")
+# ── Section 5: Reconciliation check ──
+with st.expander("✅ Reconciliation Check"):
+    st.write(f"Phase 1 profit (Ravi solo): {inr(phase1_profit)}")
+    st.write(f"Phase 2 total profit (all months, all partners): {inr(total_allocated - phase1_profit)}")
+    st.write(f"**Total allocated across app: {inr(total_allocated)}**")
+    st.caption(
+        "Compare this to ERPNext's Profit and Loss Statement for the full date range "
+        f"({PHASE1_START.strftime('%d %b %Y')} \u2013 {today.strftime('%d %b %Y')}). "
+        "If they don't match, check the ERPNext company/date filters."
+    )
